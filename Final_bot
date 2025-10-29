@@ -1,0 +1,256 @@
+# main.py
+# Crypto Futures Signal Bot - Python
+# Uses Binance Futures public klines -> sends PRE/CONFIRM alerts to Telegram (no auto-trade)
+# IMPORTANT: Token/chat id are embedded (you confirmed). If you want ENV vars later, tell me.
+
+import os, time, json, requests
+from datetime import datetime
+
+# ========== CONFIG (پِیست شده تو فایل مطابق سفارش شما) ==========
+BOT_TOKEN = "8470102772:AAEPXziOuK-xGvGIUuaJP7R4dsbR6G5t8Ik"
+CHAT_ID   = "5298327656"
+
+WATCH = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"]
+TIMEFRAMES = ["15m","1h"]   # 15m = index 0, 1h = index 1
+POLL_SECONDS = 120          # بررسی هر 120 ثانیه
+EMA_FAST = 9
+EMA_SLOW = 21
+ATR_PERIOD = 14
+PRE_DIST_ATR = 0.25
+RR = 2.0
+LOOKBACK_ZONES = 80
+BINANCE_FAPI = "https://fapi.binance.com/fapi/v1/klines"
+STATE_FILE = "final_state.json"
+HTTP_TIMEOUT = 12
+
+# ========== helpers ==========
+def http_get(url, params=None, timeout=HTTP_TIMEOUT):
+    r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def fetch_klines(symbol, interval, limit=300):
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    data = http_get(BINANCE_FAPI, params=params)
+    kl = []
+    for k in data:
+        kl.append({
+            "t": k[0], "open": float(k[1]), "high": float(k[2]),
+            "low": float(k[3]), "close": float(k[4]), "vol": float(k[5])
+        })
+    return kl
+
+def ema_list(values, period):
+    if not values or period<=0: return []
+    k = 2.0/(period+1)
+    ema = [values[0]]
+    prev = values[0]
+    for v in values[1:]:
+        prev = v*k + prev*(1-k)
+        ema.append(prev)
+    return ema
+
+def compute_atr(klines, period=14):
+    if len(klines) < 2: return [None]*len(klines)
+    trs = []
+    for i in range(1,len(klines)):
+        high, low, prevc = klines[i]["high"], klines[i]["low"], klines[i-1]["close"]
+        tr = max(high-low, abs(high-prevc), abs(low-prevc))
+        trs.append(tr)
+    atrs = [None]
+    for i in range(len(trs)):
+        if i+1 < period: atrs.append(None)
+        else: atrs.append(sum(trs[i+1-period:i+1])/period)
+    return atrs
+
+def detect_pinbar(k):
+    if not k: return None
+    o,c,h,l = k["open"],k["close"],k["high"],k["low"]
+    body = abs(c-o) if abs(c-o)>0 else 1e-9
+    wick_top = h - max(c,o); wick_bot = min(c,o) - l
+    if wick_bot > 1.3*body and c>o: return "bull_pin"
+    if wick_top > 1.3*body and c<o: return "bear_pin"
+    return None
+
+def detect_engulfing(prev, cur):
+    if not prev or not cur: return None
+    po,pc = prev["open"], prev["close"]
+    co,cc = cur["open"], cur["close"]
+    if cc>co and pc<po and cc>po and co<pc: return "bull_engulf"
+    if cc<co and pc>po and cc<po and co>pc: return "bear_engulf"
+    return None
+
+def detect_mtr(k, atr_val):
+    if not k or not atr_val or atr_val<=0: return None
+    o,c,h,l = k["open"],k["close"],k["high"],k["low"]
+    wick_top = h - max(o,c); wick_bot = min(o,c) - l
+    if wick_top >= 1.6*atr_val and c>o: return "bull_mtr"
+    if wick_bot >= 1.6*atr_val and c<o: return "bear_mtr"
+    return None
+
+def find_zone(klines, lookback=LOOKBACK_ZONES):
+    seg = klines[-lookback:] if len(klines)>=lookback else klines
+    highs = [k["high"] for k in seg]; lows = [k["low"] for k in seg]
+    return min(lows), max(highs)
+
+def calc_sl_tp(entry, dirn, atr_val, zone_low=None, zone_high=None):
+    if not atr_val or atr_val<=0: atr_val = entry*0.01
+    if dirn=="long":
+        sl = (zone_low - 0.25*atr_val) if zone_low else (entry - 1.5*atr_val)
+        risk = entry - sl
+        tp = entry + risk * RR
+    else:
+        sl = (zone_high + 0.25*atr_val) if zone_high else (entry + 1.5*atr_val)
+        risk = sl - entry
+        tp = entry - risk * RR
+    return round(sl,6), round(tp,6)
+
+def send_telegram(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, data={"chat_id":CHAT_ID,"text":text}, timeout=10)
+        if r.status_code != 200:
+            print("TG send failed:", r.status_code, r.text[:200])
+        return r.status_code==200
+    except Exception as e:
+        print("TG error:", e)
+        return False
+
+# ========== state ==========
+def load_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE,"r") as f: return json.load(f)
+    except: pass
+    return {}
+def save_state(s):
+    try:
+        with open(STATE_FILE,"w") as f: json.dump(s,f)
+    except Exception as e:
+        print("Save state err", e)
+
+# ========== analysis per TF ==========
+def analyze_tf(klines):
+    closes = [k["close"] for k in klines]
+    ef = ema_list(closes, EMA_FAST); es = ema_list(closes, EMA_SLOW)
+    ht_flip = 0
+    if len(ef)>=2 and len(es)>=2:
+        if ef[-2] < es[-2] and ef[-1] > es[-1]: ht_flip = 1
+        elif ef[-2] > es[-2] and ef[-1] < es[-1]: ht_flip = -1
+    atrs = compute_atr(klines, ATR_PERIOD)
+    atr_val = next((a for a in reversed(atrs) if a), None)
+    prev = klines[-2] if len(klines)>=2 else None
+    last = klines[-1]
+    pa_prev = detect_pinbar(prev) if prev else None
+    pa_last = detect_pinbar(last)
+    eng_prev = detect_engulfing(prev,last) if prev else None
+    mtr_prev = detect_mtr(prev, atr_val) if prev else None
+    mtr_last = detect_mtr(last, atr_val)
+    zone_low, zone_high = find_zone(klines)
+    return {"ht_flip":ht_flip, "pa_prev":pa_prev or eng_prev, "pa_last":pa_last,
+            "mtr_prev":mtr_prev, "mtr_last":mtr_last, "atr":atr_val,
+            "zone_low":zone_low, "zone_high":zone_high,
+            "prev_close": prev["close"] if prev else None, "last_close": last["close"]}
+
+# ========== combine across TFs ==========
+def get_signals(symbol):
+    per = {}
+    for tf in TIMEFRAMES:
+        kl = fetch_klines(symbol, tf, limit=300)
+        per[tf] = analyze_tf(kl)
+    results = []
+    # PRE check
+    pre_dir = None; pre_reasons=[]
+    for tf in TIMEFRAMES:
+        r = per[tf]
+        if r["pa_prev"] or r["mtr_prev"]:
+            d = None
+            if r["pa_prev"] and "bull" in r["pa_prev"]: d="long"
+            elif r["pa_prev"] and "bear" in r["pa_prev"]: d="short"
+            elif r["mtr_prev"] and "bull" in r["mtr_prev"]: d="long"
+            elif r["mtr_prev"] and "bear" in r["mtr_prev"]: d="short"
+            if d:
+                if pre_dir is None: pre_dir = d
+                elif pre_dir != d: pre_dir = "conflict"
+                pre_reasons.append(f"{tf}:{r['pa_prev'] or r['mtr_prev']}")
+    if pre_dir and pre_dir!="conflict" and len(pre_reasons)>=len(TIMEFRAMES):
+        entry = per[TIMEFRAMES[0]]["prev_close"]
+        atrv = per[TIMEFRAMES[0]]["atr"] or 0
+        low,high = per[TIMEFRAMES[0]]["zone_low"], per[TIMEFRAMES[0]]["zone_high"]
+        dist = min(abs(entry-low), abs(entry-high)) if entry and low and high else 99999
+        if atrv>0 and dist <= PRE_DIST_ATR * atrv:
+            results.append(("PRE", pre_dir, {"entry":entry, "atr":atrv, "reasons":pre_reasons}))
+    # CONFIRM
+    confirm_dir=None; confirm_reasons=[]
+    for tf in TIMEFRAMES:
+        r=per[tf]; cnt=0; parts=[]
+        if r["ht_flip"]!=0:
+            cnt+=1; parts.append("HT")
+        if r["pa_last"]:
+            cnt+=1; parts.append(r["pa_last"])
+        if r["mtr_last"]:
+            cnt+=1; parts.append(r["mtr_last"])
+        if cnt>=2:
+            d = "long" if (r["ht_flip"]==1 or (r["pa_last"] and "bull" in r["pa_last"]) or (r["mtr_last"] and "bull" in r["mtr_last"])) else "short"
+            if confirm_dir is None: confirm_dir=d
+            elif confirm_dir!=d: confirm_dir="conflict"
+            confirm_reasons.append(f"{tf}:{','.join(parts)}")
+    if confirm_dir and confirm_dir!="conflict" and len(confirm_reasons)>=len(TIMEFRAMES):
+        entry = per[TIMEFRAMES[0]]["last_close"]
+        atrv = per[TIMEFRAMES[0]]["atr"] or 0
+        zl,zr = per[TIMEFRAMES[0]]["zone_low"], per[TIMEFRAMES[0]]["zone_high"]
+        sl,tp = calc_sl_tp(entry, "long" if confirm_dir=="long" else "short", atrv, zl if confirm_dir=="long" else None, zr if confirm_dir=="short" else None)
+        results.append(("CONFIRM", confirm_dir, {"entry":entry, "sl":sl, "tp":tp, "atr":atrv, "reasons":confirm_reasons}))
+    return results
+
+# ========== message formatting ==========
+def format_msg(kind, sym, info):
+    t = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    if kind=="PRE":
+        return (f"⚠️ PREPARE (1-candle)\n{sym}\nReason: {'; '.join(info.get('reasons',[]))}\nEntry approx: {info.get('entry')}\nTime: {t}")
+    else:
+        dirn = info.get('dir')
+        return (f"✅ STRONG {'BUY' if dirn=='long' else 'SELL'} Signal\n{sym}\nEntry: {info.get('entry')}\nSL: {info.get('sl')}\nTP: {info.get('tp')}\nReasons: {'; '.join(info.get('reasons',[]))}\nTime: {t}")
+
+# ========== main loop ==========
+def main():
+    state = load_state()
+    print("Bot started:", datetime.utcnow().isoformat())
+    try:
+        send_telegram(f"🤖 Crypto Futures Signal Bot started. Watching: {', '.join(WATCH)}")
+    except: pass
+    while True:
+        try:
+            for sym in WATCH:
+                events = get_signals(sym)
+                for ev in events:
+                    kind, direction, info = ev
+                    uid = f"{kind}|{direction}|{sym}|{info.get('entry')}"
+                    key = f"{sym}|{kind}"
+                    if state.get(key) != uid:
+                        payload = {**info, "dir":direction} if kind!="PRE" else info
+                        msg = format_msg(kind, sym, payload)
+                        ok = send_telegram(msg)
+                        if ok:
+                            print("Sent", kind, sym, direction, "entry", info.get("entry"))
+                            state[key] = uid; save_state(state)
+                        else:
+                            print("Failed to send TG for", sym)
+            time.sleep(POLL_SECONDS)
+        except Exception as e:
+            print("Main loop error:", e)
+            time.sleep(10)
+
+if __name__ == "__main__":
+    main()
+// server.js - optional Node version (kept for compatibility). Not required if you run main.py
+const express = require("express");
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const app = express();
+const PORT = process.env.PORT || 3000;
+const BOT_TOKEN = "8470102772:AAEPXziOuK-xGvGIUuaJP7R4dsbR6G5t8Ik";
+const CHAT_ID = "5298327656";
+app.get("/", (req,res)=> res.send("Bot placeholder (use main.py)"));
+app.listen(PORT, ()=> console.log("Server listening on",PORT));
